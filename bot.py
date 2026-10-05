@@ -568,6 +568,11 @@ async def main() -> None:
         raise RuntimeError("Переменная BOT_TOKEN не задана")
     if quota.configured():
         await asyncio.to_thread(quota.initialize)
+        logging.info("Постоянная база лимитов подключена")
+    else:
+        logging.warning("DATABASE_URL не задан: лимиты и покупка Plus+ отключены")
+    if not os.getenv("PAYMENT_SUPPORT_USERNAME"):
+        logging.warning("PAYMENT_SUPPORT_USERNAME не задан: платежи Stars отключены")
 
     global download_slots
     download_slots = asyncio.Semaphore(

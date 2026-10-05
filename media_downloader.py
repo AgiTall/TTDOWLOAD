@@ -8,8 +8,8 @@ import os
 import base64
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit, urlencode, quote
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit, urlencode, quote, urljoin
+from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
@@ -41,6 +41,84 @@ class UnsupportedUrlError(MediaDownloadError):
 
 class FileTooLargeError(MediaDownloadError):
     """Итоговый файл превышает лимит отправки."""
+
+
+TIKWM_MEDIA_DOMAINS = ("tikwm.com", "tiktokcdn.com", "tiktokcdn-us.com",
+                       "tiktokcdn-eu.com", "byteoversea.com", "ibytedtos.com")
+
+
+def _allowed_tikwm_media(url: str) -> bool:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return (parsed.scheme == "https" and not parsed.username and not parsed.password
+            and not port and any(host == domain or host.endswith("." + domain)
+                             for domain in TIKWM_MEDIA_DOMAINS))
+
+
+class _SafeTikwmRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _allowed_tikwm_media(newurl):
+            raise MediaDownloadError("Сервис TikTok вернул небезопасный адрес файла.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _tikwm_video(url: str, directory: Path, max_bytes: int, quality: str) -> DownloadedMedia:
+    """Get TikWM's clean HD/SD MP4. Never fall back to a watermarked link."""
+    form = urlencode({"url": url, "hd": "1"}).encode()
+    request = Request("https://www.tikwm.com/api/", data=form,
+                      headers={"Content-Type": "application/x-www-form-urlencoded",
+                               "User-Agent": "Mozilla/5.0"})
+    try:
+        with urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except (OSError, ValueError) as exc:
+        raise MediaDownloadError("Не удалось получить видео TikTok без водяного знака. Попробуйте позже.") from exc
+    data = payload.get("data") if isinstance(payload, dict) and payload.get("code") == 0 else None
+    if not isinstance(data, dict):
+        raise MediaDownloadError("Видео TikTok недоступно через сервис без водяного знака.")
+    if quality == "1080":
+        candidates = [data.get("hdplay"), data.get("play")]
+    else:
+        candidates = [data.get("play"), data.get("hdplay")]
+    opener = build_opener(_SafeTikwmRedirect())
+    too_large = False
+    for raw_link in candidates:
+        if not raw_link:
+            continue
+        media_url = urljoin("https://www.tikwm.com/", str(raw_link))
+        if not _allowed_tikwm_media(media_url):
+            continue
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(data.get("id") or "video"))[:32] or "video"
+        path = directory / f"tiktok-{safe_id}.mp4"
+        try:
+            with opener.open(Request(media_url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30) as response:
+                if not _allowed_tikwm_media(response.url):
+                    continue
+                with path.open("wb") as output:
+                    total = 0
+                    while chunk := response.read(256 * 1024):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise FileTooLargeError("Файл TikTok превышает допустимый размер для Telegram.")
+                        output.write(chunk)
+            with path.open("rb") as downloaded:
+                header = downloaded.read(12)
+            if len(header) >= 8 and header[4:8] == b"ftyp":
+                return DownloadedMedia(path, str(data.get("title") or "TikTok видео")[:200], url)
+        except FileTooLargeError:
+            path.unlink(missing_ok=True)
+            too_large = True
+            continue
+        except (OSError, MediaDownloadError):
+            pass
+        path.unlink(missing_ok=True)
+    if too_large:
+        raise FileTooLargeError("Даже доступная версия TikTok без водяного знака превышает лимит файла.")
+    raise MediaDownloadError("Не удалось скачать версию TikTok без водяного знака. Попробуйте позже.")
 
 
 @dataclass(frozen=True)
@@ -174,6 +252,9 @@ def download_media(url: str, directory: Path, max_bytes: int, quality: str = "72
 
     if quality not in {"1080", "720", "360", "audio"}:
         raise MediaDownloadError("Неизвестный формат файла.")
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if quality != "audio" and (host == "tiktok.com" or host.endswith(".tiktok.com")):
+        return _tikwm_video(url, directory, max_bytes, quality)
     height = {"1080": 1080, "720": 720, "360": 480}.get(quality)
     options = {
         "format": "bestaudio/best" if quality == "audio" else

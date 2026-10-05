@@ -66,9 +66,14 @@ history: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=10))
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 
 
-def format_choices(count: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=f"Видео {q}p", callback_data=f"dl:{q}") for q in ("1080", "720", "360")],
-            [InlineKeyboardButton(text="🎵 MP3", callback_data="dl:audio")]]
+def format_choices(count: int, is_tiktok: bool = False) -> InlineKeyboardMarkup:
+    if is_tiktok:
+        rows = [[InlineKeyboardButton(text="✨ HD без водяного знака (Plus+)", callback_data="dl:1080")],
+                [InlineKeyboardButton(text="🎬 SD без водяного знака", callback_data="dl:720")],
+                [InlineKeyboardButton(text="🎵 MP3", callback_data="dl:audio")]]
+    else:
+        rows = [[InlineKeyboardButton(text=f"Видео {q}p", callback_data=f"dl:{q}") for q in ("1080", "720", "360")],
+                [InlineKeyboardButton(text="🎵 MP3", callback_data="dl:audio")]]
     if count > 1:
         rows.append([InlineKeyboardButton(text=f"📦 Все {count} ссылок, 720p", callback_data="dl:batch")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -215,8 +220,9 @@ async def handle_link(message: Message) -> None:
         if status.remaining <= 0:
             await message.answer(exhausted_text(status), reply_markup=plus_button())
             return
+    tik_tok = len(urls) == 1 and "tiktok.com" in urls[0].split("/", 3)[2]
     await message.answer(title + f"Найдено ссылок: {len(urls)}. Выберите формат:",
-                         reply_markup=format_choices(len(urls)))
+                         reply_markup=format_choices(len(urls), is_tiktok=tik_tok))
 
 
 @router.message(Command("history"))

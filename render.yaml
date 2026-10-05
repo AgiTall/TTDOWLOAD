@@ -14,6 +14,8 @@ services:
         sync: false
       - key: PAYMENT_SUPPORT_USERNAME
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: MAX_UPLOAD_MB
         value: "49"
       - key: MAX_CONCURRENT_DOWNLOADS

@@ -13,11 +13,10 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py media_downloader.py ./
+COPY bot.py media_downloader.py quota.py ./
 
 RUN useradd --system --uid 10001 --create-home botuser \
     && chown -R botuser:botuser /app
 USER botuser
 
 CMD ["python", "bot.py"]
-

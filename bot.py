@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import re
+from datetime import datetime, timezone
 from collections import defaultdict, deque
 from contextlib import suppress
 from html import escape
@@ -33,19 +34,21 @@ from media_downloader import (
     get_media_info,
     search_music,
 )
+import quota
 
 
 WELCOME_TEXT = (
     "<b>Media Downloader</b>\n\n"
     "Пришлите ссылку на видео или просто напишите название песни. "
     "Я предложу источник и покажу найденные треки. Управление — кнопками внизу.\n\n"
-    "Доступны TikTok, YouTube, Instagram, Facebook, X, Vimeo и SoundCloud. Лимит файла — 49 МБ."
+    "Доступны TikTok, YouTube, Instagram, Facebook, X, Vimeo и SoundCloud. "
+    "Бесплатно: 5 файлов за 24 часа, до 25 МБ. Plus+: 99 Stars за 24 часа, до 30 файлов и 49 МБ."
 )
 
 MENU_VIDEO = "📹 Видео"
 MENU_MUSIC = "🎵 Музыка"
 MENU_HISTORY = "🕘 История"
-MENU_SUPPORT = "⭐ Поддержать"
+MENU_SUPPORT = "⭐ Plus+"
 MENU = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text=MENU_VIDEO), KeyboardButton(text=MENU_MUSIC)],
     [KeyboardButton(text=MENU_HISTORY), KeyboardButton(text=MENU_SUPPORT)],
@@ -103,6 +106,38 @@ def result_page(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+PLUS_TEXT = (
+    "⭐ <b>Plus+ — 99 Stars на 24 часа</b>\n\n"
+    "Что входит:\n"
+    "• до <b>30 успешных загрузок</b> за 24 часа после покупки;\n"
+    "• видео до <b>1080p</b> и файлы до <b>49 МБ</b>;\n"
+    "• пакетная загрузка до <b>10 ссылок</b> (каждый файл считается отдельно).\n\n"
+    "Без Plus+: <b>5 успешных файлов</b> за 24 часа, до 720p и 25 МБ за файл. "
+    "Неудачные загрузки лимит не расходуют. Это доступ на 24 часа, не безлимит."
+)
+
+
+def plus_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Купить Plus+ — 99 Stars", callback_data="buy:plus")],
+        [InlineKeyboardButton(text="❤️ Добровольный донат", callback_data="show:donate")],
+    ])
+
+
+def reset_text(status: quota.QuotaStatus) -> str:
+    remaining = max(0, int((status.resets_at - datetime.now(timezone.utc)).total_seconds()))
+    hours, minutes = divmod((remaining + 59) // 60, 60)
+    return f"через {hours} ч {minutes} мин"
+
+
+def exhausted_text(status: quota.QuotaStatus) -> str:
+    if status.is_plus:
+        return ("⏳ Вы использовали все 30 загрузок Plus+. Доступ обновится "
+                f"{reset_text(status)}. Можно купить ещё один Plus+ за 99 Stars.")
+    return ("⏳ Вы исчерпали 5 бесплатных загрузок на 24 часа. Лимит обновится "
+            f"{reset_text(status)}. Подождите или купите Plus+ за 99 Stars.\n\n" + PLUS_TEXT)
+
+
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     raw = os.getenv(name, str(default))
     try:
@@ -117,7 +152,14 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 @router.message(CommandStart())
 @router.message(Command("help"))
 async def show_help(message: Message) -> None:
-    await message.answer(WELCOME_TEXT, reply_markup=MENU)
+    details = ""
+    if message.from_user and quota.configured():
+        try:
+            status = await asyncio.to_thread(quota.get_status, message.from_user.id)
+            details = f"\n\nОсталось загрузок: <b>{status.remaining}</b>. Обновление {reset_text(status)}."
+        except Exception:
+            logging.exception("Не удалось прочитать лимит")
+    await message.answer(WELCOME_TEXT + details, reply_markup=MENU)
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -134,7 +176,7 @@ async def handle_link(message: Message) -> None:
         await show_history(message)
         return
     if message.text == MENU_SUPPORT:
-        await show_donations(message)
+        await show_plus(message)
         return
     raw_urls = URL_RE.findall(message.text)[:10]
     if not raw_urls:
@@ -163,6 +205,16 @@ async def handle_link(message: Message) -> None:
                 title += f"Просмотров: {info['view_count']:,}\n"
         except MediaDownloadError:
             pass
+    if quota.configured():
+        try:
+            status = await asyncio.to_thread(quota.get_status, message.from_user.id)
+        except Exception:
+            logging.exception("Не удалось прочитать лимит")
+            await message.answer("⚠️ Лимиты временно недоступны. Попробуйте позже.")
+            return
+        if status.remaining <= 0:
+            await message.answer(exhausted_text(status), reply_markup=plus_button())
+            return
     await message.answer(title + f"Найдено ссылок: {len(urls)}. Выберите формат:",
                          reply_markup=format_choices(len(urls)))
 
@@ -195,6 +247,27 @@ async def show_donations(message: Message) -> None:
         ]))
 
 
+@router.message(Command("plus"))
+async def show_plus(message: Message) -> None:
+    details = ""
+    if message.from_user and quota.configured():
+        try:
+            status = await asyncio.to_thread(quota.get_status, message.from_user.id)
+            tier = "Plus+" if status.is_plus else "бесплатно"
+            details = (f"\n\nВаш тариф: <b>{tier}</b>. Осталось: <b>{status.remaining}</b> файлов. "
+                       f"Обновление {reset_text(status)}.")
+        except Exception:
+            logging.exception("Не удалось прочитать лимит")
+            details = "\n\n⚠️ База лимитов временно недоступна."
+    await message.answer(PLUS_TEXT + details, reply_markup=plus_button())
+
+
+@router.callback_query(F.data == "show:donate")
+async def donation_details(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await show_donations(callback.message)
+
+
 @router.callback_query(F.data.startswith("donate:"))
 async def donate_invoice(callback: CallbackQuery) -> None:
     await callback.answer()
@@ -212,8 +285,48 @@ async def donate_invoice(callback: CallbackQuery) -> None:
     )
 
 
+@router.callback_query(F.data == "buy:plus")
+async def plus_invoice(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if not quota.configured():
+        await callback.message.answer("Покупка Plus+ временно недоступна: база лимитов ещё не подключена.")
+        return
+    if not os.getenv("PAYMENT_SUPPORT_USERNAME"):
+        await callback.message.answer("Покупка Plus+ временно недоступна: контакт поддержки ещё не настроен.")
+        return
+    try:
+        status = await asyncio.to_thread(quota.get_status, callback.from_user.id)
+    except Exception:
+        logging.exception("База лимитов недоступна перед платежом")
+        await callback.message.answer("База лимитов временно недоступна. Платёж не создан.")
+        return
+    if status.is_plus and status.remaining > 0:
+        await callback.message.answer(f"⭐ Plus+ уже активен: осталось {status.remaining} файлов. "
+                                      f"Доступ до обновления {reset_text(status)}.")
+        return
+    await callback.message.answer_invoice(
+        title="Plus+ на 24 часа",
+        description="До 30 файлов за 24 часа, до 49 МБ, 1080p и пакетная загрузка до 10 ссылок.",
+        payload="plus:v1", currency="XTR",
+        prices=[LabeledPrice(label="Plus+ на 24 часа", amount=quota.PLUS_PRICE)],
+    )
+
+
 @router.pre_checkout_query()
 async def pre_checkout(query: PreCheckoutQuery) -> None:
+    if query.invoice_payload == "plus:v1":
+        valid = (quota.configured() and bool(os.getenv("PAYMENT_SUPPORT_USERNAME"))
+                 and query.currency == "XTR" and query.total_amount == quota.PLUS_PRICE)
+        if valid:
+            try:
+                status = await asyncio.to_thread(quota.get_status, query.from_user.id)
+                if status.is_plus and status.remaining > 0:
+                    valid = False
+            except Exception:
+                valid = False
+                logging.exception("База лимитов недоступна при подтверждении платежа")
+        await query.answer(ok=valid, error_message=None if valid else "Покупка временно недоступна. Попробуйте позже.")
+        return
     valid = (bool(os.getenv("PAYMENT_SUPPORT_USERNAME"))
              and query.invoice_payload in {"donation:50", "donation:100", "donation:250"}
              and query.currency == "XTR"
@@ -224,11 +337,46 @@ async def pre_checkout(query: PreCheckoutQuery) -> None:
 @router.message(F.successful_payment)
 async def donation_received(message: Message) -> None:
     payment = message.successful_payment
+    if payment.invoice_payload == "plus:v1":
+        if payment.currency != "XTR" or payment.total_amount != quota.PLUS_PRICE:
+            logging.error("Некорректный платёж Plus+ charge_id=%s", payment.telegram_payment_charge_id)
+            await message.answer("Оплата получена, но данные платежа требуют проверки. Напишите /paysupport.")
+            return
+        try:
+            created = await asyncio.to_thread(
+                quota.grant_plus, message.from_user.id, payment.telegram_payment_charge_id,
+                payment.total_amount,
+            )
+        except Exception:
+            logging.exception("Не удалось сохранить платёж Plus+ charge_id=%s", payment.telegram_payment_charge_id)
+            await message.answer("Оплата прошла, но доступ пока не активирован из-за ошибки базы. "
+                                 "Сохраните квитанцию и напишите /paysupport.")
+            return
+        if created:
+            await message.answer("⭐ Plus+ активирован на 24 часа! У вас 30 загрузок до 49 МБ, "
+                                 "доступны 1080p и пакетная загрузка до 10 ссылок.", reply_markup=MENU)
+        else:
+            await message.answer("⭐ Этот платёж Plus+ уже учтён.", reply_markup=MENU)
+        return
     logging.info("Stars donation user=%s amount=%s charge_id=%s",
                  message.from_user.id if message.from_user else None,
                  payment.total_amount, payment.telegram_payment_charge_id)
     await message.answer("❤️ Спасибо за поддержку! Сохраните квитанцию Telegram на случай вопроса по платежу.",
                          reply_markup=MENU)
+
+
+@router.message(F.refunded_payment)
+async def payment_refunded(message: Message) -> None:
+    payment = message.refunded_payment
+    if payment.invoice_payload == "plus:v1" and quota.configured():
+        try:
+            await asyncio.to_thread(quota.refund_plus, payment.telegram_payment_charge_id)
+        except Exception:
+            logging.exception("Не удалось отметить возврат Plus+ charge_id=%s",
+                              payment.telegram_payment_charge_id)
+        await message.answer("Возврат Stars зарегистрирован. Доступ Plus+ по этому платежу отменён.")
+    else:
+        await message.answer("Возврат Stars зарегистрирован.")
 
 
 @router.message(Command("paysupport"))
@@ -341,13 +489,39 @@ async def download_choice(callback: CallbackQuery) -> None:
     targets = urls if quality == "batch" else urls[:1]
     if quality == "batch":
         quality = "720"
+    account = None
+    if quota.configured():
+        try:
+            account = await asyncio.to_thread(quota.get_status, user_id)
+        except Exception:
+            logging.exception("Не удалось проверить лимит")
+            await callback.message.answer("⚠️ Лимиты временно недоступны. Попробуйте позже.")
+            return
+        if account.remaining <= 0:
+            await callback.message.answer(exhausted_text(account), reply_markup=plus_button())
+            return
+        if len(targets) > (10 if account.is_plus else 3):
+            await callback.message.answer("📦 Бесплатная пакетная загрузка — до 3 ссылок. "
+                                          "Plus+ позволяет до 10 ссылок за раз.", reply_markup=plus_button())
+            return
+        if not account.is_plus and quality == "1080":
+            await callback.message.answer("🎬 1080p доступно в Plus+. Бесплатно можно выбрать 720p или 360p.",
+                                          reply_markup=plus_button())
+            return
     active_users.add(user_id)
     status = await callback.message.answer(f"⏳ Обрабатываю {len(targets)} файл(ов)…")
-    max_bytes = env_int("MAX_UPLOAD_MB", 49, 1, 49) * 1024 * 1024
     try:
         async with download_slots:
             for index, url in enumerate(targets, 1):
                 try:
+                    if quota.configured():
+                        account = await asyncio.to_thread(quota.get_status, user_id)
+                        if account.remaining <= 0:
+                            await callback.message.answer(exhausted_text(account), reply_markup=plus_button())
+                            break
+                    max_mb = min(env_int("MAX_UPLOAD_MB", 49, 1, 49),
+                                 account.max_mb if account else 49)
+                    max_bytes = max_mb * 1024 * 1024
                     with tempfile.TemporaryDirectory(prefix="telegram-media-") as tmp:
                         media = await asyncio.to_thread(download_media, url, Path(tmp), max_bytes, quality)
                         caption = f"<b>{escape(media.title[:180])}</b>\nИсточник: {escape(media.source_url[:700])}"
@@ -363,6 +537,8 @@ async def download_choice(callback: CallbackQuery) -> None:
                             await callback.message.answer_document(upload, caption=caption, request_timeout=180)
                     if url not in history[user_id]:
                         history[user_id].appendleft(url)
+                    if quota.configured():
+                        account = await asyncio.to_thread(quota.record_success, user_id)
                 except (FileTooLargeError, MediaDownloadError) as exc:
                     await callback.message.answer(f"❌ {index}/{len(targets)}: {escape(str(exc))}")
                 except Exception:
@@ -370,6 +546,9 @@ async def download_choice(callback: CallbackQuery) -> None:
                     await callback.message.answer(f"❌ {index}/{len(targets)}: внутренняя ошибка.")
         with suppress(TelegramBadRequest):
             await status.delete()
+        if account and quota.configured():
+            await callback.message.answer(
+                f"✅ Осталось загрузок: <b>{account.remaining}</b>. Обновление {reset_text(account)}.")
     finally:
         active_users.discard(user_id)
 
@@ -387,6 +566,8 @@ async def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Переменная BOT_TOKEN не задана")
+    if quota.configured():
+        await asyncio.to_thread(quota.initialize)
 
     global download_slots
     download_slots = asyncio.Semaphore(
@@ -415,6 +596,9 @@ async def main() -> None:
                 BotCommand(command="music", description="Поиск музыки"),
                 BotCommand(command="history", description="Последние ссылки"),
                 BotCommand(command="clear", description="Очистить историю"),
+                BotCommand(command="plus", description="Plus+ и лимиты"),
+                BotCommand(command="donate", description="Добровольный донат"),
+                BotCommand(command="paysupport", description="Помощь по платежам"),
             ]
         )
         await bot.delete_webhook(drop_pending_updates=False)

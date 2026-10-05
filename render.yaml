@@ -8,6 +8,12 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: PAYMENT_SUPPORT_USERNAME
+        sync: false
       - key: MAX_UPLOAD_MB
         value: "49"
       - key: MAX_CONCURRENT_DOWNLOADS

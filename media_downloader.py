@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import json
+import os
+import base64
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlencode, quote
@@ -110,21 +112,36 @@ def search_music(query: str, source: str = "all") -> list[dict]:
                 query = json.load(response).get("title") or query
         except (OSError, ValueError):
             pass
-    if source in {"all", "spotify"}:
-        try:
-            params = urlencode({"term": query, "entity": "song", "limit": 4})
-            request = Request("https://itunes.apple.com/search?" + params,
-                              headers={"User-Agent": "Mozilla/5.0"})
-            with urlopen(request, timeout=10) as response:
-                tracks = json.load(response).get("results", [])
-            for track in tracks:
-                title = track.get("trackName") or query
-                artist = track.get("artistName") or ""
-                results.append({"title": title, "artist": artist,
-                                "url": f"scsearch1:{artist} {title}", "source": "Каталог музыки"})
-        except (OSError, ValueError):
-            pass
     if source == "spotify":
+        client_id = os.getenv("SPOTIFY_CLIENT_ID")
+        client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            raise MediaDownloadError("Поиск Spotify пока не настроен: нужны SPOTIFY_CLIENT_ID и SPOTIFY_CLIENT_SECRET в Render.")
+        try:
+            credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+            auth = Request("https://accounts.spotify.com/api/token",
+                           data=b"grant_type=client_credentials",
+                           headers={"Authorization": f"Basic {credentials}",
+                                    "Content-Type": "application/x-www-form-urlencoded"})
+            with urlopen(auth, timeout=10) as response:
+                access_token = json.load(response)["access_token"]
+            tracks = []
+            for offset in (0, 10):
+                params = urlencode({"q": query, "type": "track", "limit": 10, "offset": offset})
+                request = Request("https://api.spotify.com/v1/search?" + params,
+                                  headers={"Authorization": f"Bearer {access_token}"})
+                with urlopen(request, timeout=15) as response:
+                    batch = json.load(response).get("tracks", {}).get("items", [])
+                tracks.extend(batch)
+                if len(batch) < 10:
+                    break
+            for track in tracks:
+                title = track.get("name") or query
+                artist = ", ".join(a.get("name", "") for a in track.get("artists", []))
+                results.append({"title": title, "artist": artist,
+                                "url": f"scsearch1:{artist} {title}", "source": "Spotify"})
+        except (OSError, ValueError, KeyError) as exc:
+            raise MediaDownloadError("Не удалось выполнить поиск Spotify. Проверьте ключи приложения и попробуйте позже.") from exc
         return results
     sources = ("yt", "sc") if source == "all" else (source,)
     for item in sources:
@@ -133,7 +150,7 @@ def search_music(query: str, source: str = "all") -> list[dict]:
         try:
             with YoutubeDL({"quiet": True, "extract_flat": True, "noplaylist": True,
                             "socket_timeout": 15}) as ydl:
-                data = ydl.extract_info(f"{item}search4:{query}", download=False)
+                data = ydl.extract_info(f"{item}search20:{query}", download=False)
                 for entry in (data or {}).get("entries", []):
                     if entry:
                         target = entry.get("webpage_url") or entry.get("url") or ""
@@ -177,18 +194,26 @@ def download_media(url: str, directory: Path, max_bytes: int, quality: str = "72
     else:
         options["merge_output_format"] = "mp4"
 
-    try:
-        with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except YtDlpDownloadError as exc:
-        message = str(exc)
-        if "larger than max-filesize" in message.lower() or "max-filesize" in message.lower():
-            raise FileTooLargeError(
-                f"Видео больше {max_megabytes} МБ — Telegram не сможет принять его от бота."
-            ) from exc
-        raise MediaDownloadError(
-            "Не удалось скачать видео. Проверьте, что оно доступно без входа в аккаунт."
-        ) from exc
+    candidates = [url]
+    if quality == "audio" and url.startswith("scsearch1:"):
+        candidates.append("ytsearch1:" + url.removeprefix("scsearch1:"))
+    info = None
+    for candidate in candidates:
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(candidate, download=True)
+            if info:
+                break
+        except YtDlpDownloadError as exc:
+            message = str(exc)
+            if "larger than max-filesize" in message.lower() or "max-filesize" in message.lower():
+                raise FileTooLargeError(
+                    f"Файл больше {max_megabytes} МБ — Telegram не сможет принять его от бота."
+                ) from exc
+            if candidate == candidates[-1]:
+                raise MediaDownloadError(
+                    "Не удалось скачать файл. Проверьте, что он доступен без входа в аккаунт."
+                ) from exc
 
     if not info:
         raise MediaDownloadError("Не удалось получить сведения о видео.")

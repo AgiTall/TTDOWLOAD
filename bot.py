@@ -19,7 +19,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BotCommand, FSInputFile, Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (BotCommand, FSInputFile, Message, CallbackQuery,
+                           InlineKeyboardButton, InlineKeyboardMarkup,
+                           KeyboardButton, ReplyKeyboardMarkup, LabeledPrice,
+                           PreCheckoutQuery)
 
 from media_downloader import (
     FileTooLargeError,
@@ -34,17 +37,28 @@ from media_downloader import (
 
 WELCOME_TEXT = (
     "<b>Media Downloader</b>\n\n"
-    "Пришлите ссылку на TikTok, YouTube, Instagram, Facebook, X, Vimeo или SoundCloud. "
-    "Выберите видео 1080p/720p/360p или MP3. Несколько ссылок отправьте одним сообщением.\n\n"
-    "Поиск музыки: /music название (или /music yt название, /music sc название). "
-    "История: /history. Очистить: /clear. Лимит файла — 49 МБ."
+    "Пришлите ссылку на видео или просто напишите название песни. "
+    "Я предложу источник и покажу найденные треки. Управление — кнопками внизу.\n\n"
+    "Доступны TikTok, YouTube, Instagram, Facebook, X, Vimeo и SoundCloud. Лимит файла — 49 МБ."
 )
+
+MENU_VIDEO = "📹 Видео"
+MENU_MUSIC = "🎵 Музыка"
+MENU_HISTORY = "🕘 История"
+MENU_SUPPORT = "⭐ Поддержать"
+MENU = ReplyKeyboardMarkup(keyboard=[
+    [KeyboardButton(text=MENU_VIDEO), KeyboardButton(text=MENU_MUSIC)],
+    [KeyboardButton(text=MENU_HISTORY), KeyboardButton(text=MENU_SUPPORT)],
+], resize_keyboard=True, is_persistent=True)
 
 router = Router()
 active_users: set[int] = set()
 download_slots: asyncio.Semaphore
 pending: dict[int, list[str]] = {}
 search_results: dict[int, list[dict]] = {}
+search_queries: dict[int, str] = {}
+search_sources: dict[int, str] = {}
+search_generations: dict[int, int] = defaultdict(int)
 history: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=10))
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 
@@ -55,6 +69,38 @@ def format_choices(count: int) -> InlineKeyboardMarkup:
     if count > 1:
         rows.append([InlineKeyboardButton(text=f"📦 Все {count} ссылок, 720p", callback_data="dl:batch")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def source_choices() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Spotify", callback_data="source:spotify")],
+        [InlineKeyboardButton(text="🟠 SoundCloud", callback_data="source:sc")],
+        [InlineKeyboardButton(text="🔴 YouTube (музыка)", callback_data="source:yt")],
+    ])
+
+
+def result_page(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    results = search_results.get(user_id, [])
+    total = max(1, (len(results) + 4) // 5)
+    page = min(max(0, page), total - 1)
+    source = search_sources.get(user_id, "")
+    name = {"spotify": "Spotify", "sc": "SoundCloud", "yt": "YouTube (музыка)"}.get(source, source)
+    lines = [f"🎶 <b>{escape(name)}</b> · страница {page + 1}/{total}", "Нажмите на трек, чтобы выбрать формат:"]
+    rows = []
+    for index in range(page * 5, min((page + 1) * 5, len(results))):
+        item = results[index]
+        artist = item.get("artist") or "Исполнитель неизвестен"
+        lines.append(f"{index + 1}. <b>{escape(item['title'][:90])}</b> — {escape(artist[:70])}")
+        rows.append([InlineKeyboardButton(text=f"🎧 {index + 1}. {item['title'][:45]}", callback_data=f"track:{index}")])
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{page - 1}"))
+    if page + 1 < total:
+        nav.append(InlineKeyboardButton(text="Дальше ➡️", callback_data=f"page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔎 Другой источник", callback_data="source:choose")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -71,16 +117,34 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 @router.message(CommandStart())
 @router.message(Command("help"))
 async def show_help(message: Message) -> None:
-    await message.answer(WELCOME_TEXT)
+    await message.answer(WELCOME_TEXT, reply_markup=MENU)
 
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_link(message: Message) -> None:
     if not message.from_user or not message.text:
         return
+    if message.text == MENU_VIDEO:
+        await message.answer("Отправьте одну ссылку на видео или несколько ссылок одним сообщением.", reply_markup=MENU)
+        return
+    if message.text == MENU_MUSIC:
+        await message.answer("Напишите название песни или пришлите ссылку на трек.", reply_markup=MENU)
+        return
+    if message.text == MENU_HISTORY:
+        await show_history(message)
+        return
+    if message.text == MENU_SUPPORT:
+        await show_donations(message)
+        return
     raw_urls = URL_RE.findall(message.text)[:10]
     if not raw_urls:
-        await message.answer("Пришлите ссылку или используйте /music.")
+        search_queries[message.from_user.id] = message.text.strip()[:150]
+        await message.answer(f"🔎 Где искать «{escape(search_queries[message.from_user.id])}»?",
+                             reply_markup=source_choices())
+        return
+    if len(raw_urls) == 1 and "open.spotify.com/track/" in raw_urls[0]:
+        search_queries[message.from_user.id] = raw_urls[0]
+        await message.answer("🎵 Ссылка на Spotify. Где искать трек?", reply_markup=source_choices())
         return
     try:
         urls = [extract_supported_url(raw) for raw in raw_urls]
@@ -116,6 +180,67 @@ async def clear_history(message: Message) -> None:
     await message.answer("История очищена.")
 
 
+@router.message(Command("donate"))
+async def show_donations(message: Message) -> None:
+    if not os.getenv("PAYMENT_SUPPORT_USERNAME"):
+        await message.answer("Поддержка Stars появится после настройки контакта для вопросов по платежам.")
+        return
+    await message.answer(
+        "⭐ <b>Поддержать бота</b>\nДонат добровольный и не даёт дополнительных лимитов или функций. "
+        "Средства помогают оплачивать хостинг и развитие бота.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ 50 Stars", callback_data="donate:50"),
+             InlineKeyboardButton(text="⭐ 100 Stars", callback_data="donate:100")],
+            [InlineKeyboardButton(text="⭐ 250 Stars", callback_data="donate:250")],
+        ]))
+
+
+@router.callback_query(F.data.startswith("donate:"))
+async def donate_invoice(callback: CallbackQuery) -> None:
+    await callback.answer()
+    amount = int(callback.data.split(":", 1)[1])
+    if amount not in {50, 100, 250}:
+        return
+    if not os.getenv("PAYMENT_SUPPORT_USERNAME"):
+        await callback.message.answer("Платежи пока не настроены.")
+        return
+    await callback.message.answer_invoice(
+        title="Поддержка Media Downloader",
+        description="Добровольный донат на хостинг и развитие бота. Без дополнительных функций или лимитов.",
+        payload=f"donation:{amount}", currency="XTR",
+        prices=[LabeledPrice(label="Поддержать бота", amount=amount)],
+    )
+
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery) -> None:
+    valid = (bool(os.getenv("PAYMENT_SUPPORT_USERNAME"))
+             and query.invoice_payload in {"donation:50", "donation:100", "donation:250"}
+             and query.currency == "XTR"
+             and query.total_amount == int(query.invoice_payload.split(":", 1)[1]))
+    await query.answer(ok=valid, error_message=None if valid else "Неверные данные платежа.")
+
+
+@router.message(F.successful_payment)
+async def donation_received(message: Message) -> None:
+    payment = message.successful_payment
+    logging.info("Stars donation user=%s amount=%s charge_id=%s",
+                 message.from_user.id if message.from_user else None,
+                 payment.total_amount, payment.telegram_payment_charge_id)
+    await message.answer("❤️ Спасибо за поддержку! Сохраните квитанцию Telegram на случай вопроса по платежу.",
+                         reply_markup=MENU)
+
+
+@router.message(Command("paysupport"))
+async def payment_support(message: Message) -> None:
+    contact = os.getenv("PAYMENT_SUPPORT_USERNAME", "").strip().lstrip("@")
+    if contact:
+        await message.answer(f"По вопросам платежей напишите @{escape(contact)} и приложите квитанцию Telegram.")
+    else:
+        await message.answer("По вопросам платежей ответьте на квитанцию Telegram и опишите проблему. "
+                             "Владелец бота должен настроить PAYMENT_SUPPORT_USERNAME в Render.")
+
+
 @router.message(Command("music"))
 async def music_search(message: Message) -> None:
     if not message.from_user:
@@ -124,19 +249,66 @@ async def music_search(message: Message) -> None:
     if not query:
         await message.answer("Напишите /music название песни; источник: /music spotify, /music yt или /music sc название.")
         return
-    source = "all"
-    if query.startswith(("yt ", "sc ", "spotify ")):
-        source, _, query = query.partition(" ")
-    status = await message.answer("🔎 Ищу треки…")
-    results = await asyncio.to_thread(search_music, query[:150], source)
-    results = [item for item in results if item["url"]][:8]
-    search_results[message.from_user.id] = results
-    if not results:
-        await status.edit_text("Ничего не найдено. Попробуйте другое название.")
+    search_queries[message.from_user.id] = query[:150]
+    await message.answer("Где искать?", reply_markup=source_choices())
+
+
+@router.callback_query(F.data.startswith("source:"))
+async def choose_source(callback: CallbackQuery) -> None:
+    await callback.answer()
+    user_id = callback.from_user.id
+    source = callback.data.split(":", 1)[1]
+    if source == "choose":
+        await callback.message.edit_text("Где искать?", reply_markup=source_choices())
         return
-    buttons = [[InlineKeyboardButton(text=f"{item['source']}: {item['title'][:45]}", callback_data=f"track:{i}")]
-               for i, item in enumerate(results)]
-    await status.edit_text("Выберите трек для MP3:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    query = search_queries.get(user_id)
+    if not query:
+        await callback.message.edit_text("Поиск устарел. Напишите название песни ещё раз.")
+        return
+    search_generations[user_id] += 1
+    generation = search_generations[user_id]
+    search_sources[user_id] = source
+    await callback.message.edit_text("🔎 Подключаюсь к каталогу…")
+    animation = asyncio.create_task(search_animation(callback.message, generation, user_id))
+    try:
+        results = await asyncio.to_thread(search_music, query, source)
+        if generation != search_generations[user_id]:
+            return
+        search_results[user_id] = [item for item in results if item["url"]][:20]
+    except MediaDownloadError as exc:
+        await callback.message.edit_text(f"⚠️ {escape(str(exc))}", reply_markup=source_choices())
+        return
+    finally:
+        animation.cancel()
+        with suppress(asyncio.CancelledError):
+            await animation
+    if not search_results[user_id]:
+        await callback.message.edit_text("Ничего не найдено. Попробуйте другой источник.",
+                                         reply_markup=source_choices())
+        return
+    text, markup = result_page(user_id, 0)
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+async def search_animation(message: Message, generation: int, user_id: int) -> None:
+    frames = ("🔎 Ищу треки ·", "🔎 Ищу треки ··", "🔎 Ищу треки ···")
+    index = 0
+    while generation == search_generations[user_id]:
+        await asyncio.sleep(3)
+        with suppress(TelegramBadRequest):
+            await message.edit_text(frames[index % len(frames)])
+        index += 1
+
+
+@router.callback_query(F.data.startswith("page:"))
+async def turn_page(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if not search_results.get(callback.from_user.id):
+        await callback.message.edit_text("Поиск устарел. Напишите название песни ещё раз.")
+        return
+    page = int(callback.data.split(":", 1)[1])
+    text, markup = result_page(callback.from_user.id, page)
+    await callback.message.edit_text(text, reply_markup=markup)
 
 
 @router.callback_query(F.data.startswith("track:"))
@@ -148,7 +320,10 @@ async def choose_track(callback: CallbackQuery) -> None:
         await callback.message.answer("Поиск устарел. Повторите /music.")
         return
     pending[callback.from_user.id] = [results[index]["url"]]
-    await callback.message.answer(escape(results[index]["title"]), reply_markup=format_choices(1))
+    await callback.message.answer(f"🎵 <b>{escape(results[index]['title'])}</b>\n"
+                                  "MP3 будет получен из доступного источника; Spotify предоставляет только данные трека.",
+                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                      [InlineKeyboardButton(text="⬇️ Скачать MP3", callback_data="dl:audio")]]))
 
 
 @router.callback_query(F.data.startswith("dl:"))

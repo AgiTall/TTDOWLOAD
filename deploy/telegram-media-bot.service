@@ -1,0 +1,33 @@
+[Unit]
+Description=Telegram Media Downloader Bot
+Documentation=https://core.telegram.org/bots/api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telegrambot
+Group=telegrambot
+WorkingDirectory=/opt/telegram-media-bot
+EnvironmentFile=/etc/telegram-media-bot.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/var/lib/telegram-media-bot
+ExecStart=/opt/telegram-media-bot/.venv/bin/python /opt/telegram-media-bot/bot.py
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=telegram-media-bot
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
+

@@ -32,6 +32,7 @@ from media_downloader import (
     download_media,
     extract_supported_url,
     get_media_info,
+    is_spotify_track_url,
     search_music,
 )
 import quota
@@ -80,8 +81,9 @@ def format_choices(count: int, is_tiktok: bool = False) -> InlineKeyboardMarkup:
 
 
 def source_choices() -> InlineKeyboardMarkup:
+    spotify_label = "🟢 Spotify" if os.getenv("SPOTIFY_EXTENDED_ACCESS") == "1" else "🟢 Spotify (ссылки)"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟢 Spotify", callback_data="source:spotify")],
+        [InlineKeyboardButton(text=spotify_label, callback_data="source:spotify")],
         [InlineKeyboardButton(text="🟠 SoundCloud", callback_data="source:sc")],
         [InlineKeyboardButton(text="🔴 YouTube (музыка)", callback_data="source:yt")],
     ])
@@ -93,13 +95,16 @@ def result_page(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
     page = min(max(0, page), total - 1)
     source = search_sources.get(user_id, "")
     name = {"spotify": "Spotify", "sc": "SoundCloud", "yt": "YouTube (музыка)"}.get(source, source)
-    lines = [f"🎶 <b>{escape(name)}</b> · страница {page + 1}/{total}", "Нажмите на трек, чтобы выбрать формат:"]
+    instruction = ("Нажмите на трек, чтобы открыть его в Spotify:"
+                   if source == "spotify" else "Нажмите на трек, чтобы выбрать формат:")
+    lines = [f"🎶 <b>{escape(name)}</b> · страница {page + 1}/{total}", instruction]
     rows = []
     for index in range(page * 5, min((page + 1) * 5, len(results))):
         item = results[index]
         artist = item.get("artist") or "Исполнитель неизвестен"
         lines.append(f"{index + 1}. <b>{escape(item['title'][:90])}</b> — {escape(artist[:70])}")
-        rows.append([InlineKeyboardButton(text=f"🎧 {index + 1}. {item['title'][:45]}", callback_data=f"track:{index}")])
+        icon = "🟢" if source == "spotify" else "🎧"
+        rows.append([InlineKeyboardButton(text=f"{icon} {index + 1}. {item['title'][:45]}", callback_data=f"track:{index}")])
     nav = []
     if page:
         nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{page - 1}"))
@@ -107,7 +112,8 @@ def result_page(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
         nav.append(InlineKeyboardButton(text="Дальше ➡️", callback_data=f"page:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text="🔎 Другой источник", callback_data="source:choose")])
+    if source != "spotify":
+        rows.append([InlineKeyboardButton(text="🔎 Другой источник", callback_data="source:choose")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -189,9 +195,17 @@ async def handle_link(message: Message) -> None:
         await message.answer(f"🔎 Где искать «{escape(search_queries[message.from_user.id])}»?",
                              reply_markup=source_choices())
         return
-    if len(raw_urls) == 1 and "open.spotify.com/track/" in raw_urls[0]:
+    if len(raw_urls) == 1 and is_spotify_track_url(raw_urls[0]):
         search_queries[message.from_user.id] = raw_urls[0]
-        await message.answer("🎵 Ссылка на Spotify. Где искать трек?", reply_markup=source_choices())
+        try:
+            results = await asyncio.to_thread(search_music, raw_urls[0], "spotify")
+        except MediaDownloadError as exc:
+            await message.answer(f"⚠️ {escape(str(exc))}")
+            return
+        search_sources[message.from_user.id] = "spotify"
+        search_results[message.from_user.id] = results
+        text, markup = result_page(message.from_user.id, 0)
+        await message.answer(text, reply_markup=markup)
         return
     try:
         urls = [extract_supported_url(raw) for raw in raw_urls]
@@ -473,9 +487,18 @@ async def choose_track(callback: CallbackQuery) -> None:
     if index >= len(results):
         await callback.message.answer("Поиск устарел. Повторите /music.")
         return
-    pending[callback.from_user.id] = [results[index]["url"]]
-    await callback.message.answer(f"🎵 <b>{escape(results[index]['title'])}</b>\n"
-                                  "MP3 будет получен из доступного источника; Spotify предоставляет только данные трека.",
+    item = results[index]
+    if not item.get("downloadable", True):
+        await callback.message.answer(
+            f"🎵 <b>{escape(item['title'])}</b>\nЭто трек Spotify. Его можно открыть в Spotify; "
+            "бот не получает MP3 из Spotify.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🟢 Открыть в Spotify", url=item["url"])]]),
+        )
+        return
+    pending[callback.from_user.id] = [item["url"]]
+    detail = f"Источник: {escape(item['source'])}. Скачаю аудио выбранной записи, если она доступна."
+    await callback.message.answer(f"🎵 <b>{escape(item['title'])}</b>\n{detail}",
                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                       [InlineKeyboardButton(text="⬇️ Скачать MP3", callback_data="dl:audio")]]))
 

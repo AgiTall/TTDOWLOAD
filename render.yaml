@@ -12,6 +12,8 @@ services:
         sync: false
       - key: SPOTIFY_CLIENT_SECRET
         sync: false
+      - key: SPOTIFY_EXTENDED_ACCESS
+        value: "0"
       - key: PAYMENT_SUPPORT_USERNAME
         sync: false
       - key: DATABASE_URL

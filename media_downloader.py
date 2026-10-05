@@ -31,6 +31,17 @@ SUPPORTED_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
 
+def is_spotify_track_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return (parsed.scheme == "https" and (parsed.hostname or "").lower() == "open.spotify.com"
+            and parsed.path.startswith("/track/") and not parsed.username
+            and not parsed.password and not port)
+
+
 class MediaDownloadError(RuntimeError):
     """Понятная пользователю ошибка загрузки."""
 
@@ -182,15 +193,27 @@ def get_media_info(url: str) -> dict:
 
 def search_music(query: str, source: str = "all") -> list[dict]:
     results = []
-    if "open.spotify.com/track/" in query:
+    original_query = query
+    spotify_link_title = None
+    if is_spotify_track_url(query):
         try:
             request = Request("https://open.spotify.com/oembed?url=" + quote(query, safe=""),
                               headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(request, timeout=10) as response:
-                query = json.load(response).get("title") or query
+                spotify_link_title = json.load(response).get("title")
+                query = spotify_link_title or query
         except (OSError, ValueError):
             pass
     if source == "spotify":
+        if os.getenv("SPOTIFY_EXTENDED_ACCESS") != "1":
+            if is_spotify_track_url(original_query):
+                return [{"title": spotify_link_title or "Трек Spotify", "artist": "",
+                         "url": original_query, "source": "Spotify-ссылка",
+                         "downloadable": False}]
+            raise MediaDownloadError(
+                "Поиск по каталогу Spotify недоступен для публичного бота без одобренного "
+                "Extended Quota Mode. Ссылку Spotify можно прислать напрямую."
+            )
         client_id = os.getenv("SPOTIFY_CLIENT_ID")
         client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         if not client_id or not client_secret:
@@ -217,7 +240,8 @@ def search_music(query: str, source: str = "all") -> list[dict]:
                 title = track.get("name") or query
                 artist = ", ".join(a.get("name", "") for a in track.get("artists", []))
                 results.append({"title": title, "artist": artist,
-                                "url": f"scsearch1:{artist} {title}", "source": "Spotify"})
+                                "url": track.get("external_urls", {}).get("spotify", ""),
+                                "source": "Spotify", "downloadable": False})
         except (OSError, ValueError, KeyError) as exc:
             raise MediaDownloadError("Не удалось выполнить поиск Spotify. Проверьте ключи приложения и попробуйте позже.") from exc
         return results
@@ -228,7 +252,10 @@ def search_music(query: str, source: str = "all") -> list[dict]:
         try:
             with YoutubeDL({"quiet": True, "extract_flat": True, "noplaylist": True,
                             "socket_timeout": 15}) as ydl:
-                data = ydl.extract_info(f"{item}search20:{query}", download=False)
+                search_query = query
+                if item == "yt":
+                    search_query += " песня музыка" if re.search(r"[а-яё]", query, re.I) else " song music"
+                data = ydl.extract_info(f"{item}search20:{search_query}", download=False)
                 for entry in (data or {}).get("entries", []):
                     if entry:
                         target = entry.get("webpage_url") or entry.get("url") or ""
@@ -242,7 +269,31 @@ def search_music(query: str, source: str = "all") -> list[dict]:
                                         "source": "YouTube" if item == "yt" else "SoundCloud"})
         except YtDlpDownloadError:
             continue
+    if source == "yt":
+        return rank_music_results(query, results)
     return results
+
+
+def rank_music_results(query: str, results: list[dict]) -> list[dict]:
+    """Prefer likely tracks and drop TV episodes from broad YouTube searches."""
+    words = [word for word in re.findall(r"[\w]+", query.casefold()) if len(word) > 2]
+    ranked = []
+    for index, item in enumerate(results):
+        title = str(item.get("title") or "").casefold()
+        artist = str(item.get("artist") or "").casefold()
+        text = title + " " + artist
+        if words and not any(word in text for word in words):
+            continue
+        if re.search(r"\b(серия|сезон|выпуск|шоу|телешоу|тнт|episode|season)\b", text):
+            continue
+        score = sum(2 for word in words if word in title) + sum(word in artist for word in words)
+        if query.casefold() in title:
+            score += 3
+        if re.search(r"\b(official|audio|lyrics|music|песня|трек|remix|клип)\b", text):
+            score += 2
+        ranked.append((-score, index, item))
+    ranked.sort()
+    return [item for _, _, item in ranked]
 
 
 def download_media(url: str, directory: Path, max_bytes: int, quality: str = "720") -> DownloadedMedia:

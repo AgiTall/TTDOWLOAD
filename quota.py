@@ -6,7 +6,11 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-import psycopg
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
+
 
 FREE_LIMIT = 5
 FREE_MAX_MB = 25
@@ -29,7 +33,7 @@ class QuotaStatus:
 
 
 def configured() -> bool:
-    return bool(os.getenv("DATABASE_URL"))
+    return psycopg is not None and bool(os.getenv("DATABASE_URL"))
 
 
 def _connect():

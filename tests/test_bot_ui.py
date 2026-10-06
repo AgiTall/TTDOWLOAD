@@ -50,7 +50,24 @@ class BotUiTests(unittest.TestCase):
 
     def test_spotify_link_must_be_from_spotify(self) -> None:
         self.assertTrue(is_spotify_track_url("https://open.spotify.com/track/123"))
+        self.assertTrue(is_spotify_track_url("https://open.spotify.com/intl-ru/track/123"))
         self.assertFalse(is_spotify_track_url("https://evil.example/?x=open.spotify.com/track/123"))
+        self.assertFalse(is_spotify_track_url("https://open.spotify.com/album/123"))
+
+    def test_get_spotify_track_info_opengraph(self) -> None:
+        from media_downloader import get_spotify_track_info
+        fake_html = (
+            b'<html><head>'
+            b'<meta property="og:title" content="Test Song" />'
+            b'<meta name="music:musician_description" content="Test Artist" />'
+            b'<meta property="og:image" content="https://example.com/cover.jpg" />'
+            b'</head></html>'
+        )
+        with patch("media_downloader.urlopen", return_value=io.BytesIO(fake_html)):
+            info = get_spotify_track_info("https://open.spotify.com/track/123")
+        self.assertEqual(info["title"], "Test Song")
+        self.assertEqual(info["artist"], "Test Artist")
+        self.assertEqual(info["image"], "https://example.com/cover.jpg")
 
 
 if __name__ == "__main__":

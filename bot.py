@@ -33,6 +33,7 @@ from media_downloader import (
     download_media,
     extract_supported_url,
     get_media_info,
+    get_spotify_track_info,
     is_spotify_track_url,
     search_music,
 )
@@ -96,8 +97,7 @@ def result_page(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
     page = min(max(0, page), total - 1)
     source = search_sources.get(user_id, "")
     name = {"spotify": "Spotify", "sc": "SoundCloud", "yt": "YouTube (музыка)"}.get(source, source)
-    instruction = ("Нажмите на трек, чтобы открыть его в Spotify:"
-                   if source == "spotify" else "Нажмите на трек, чтобы выбрать формат:")
+    instruction = "Нажмите на трек, чтобы скачать MP3:"
     lines = [f"🎶 <b>{escape(name)}</b> · страница {page + 1}/{total}", instruction]
     rows = []
     for index in range(page * 5, min((page + 1) * 5, len(results))):
@@ -197,16 +197,23 @@ async def handle_link(message: Message) -> None:
                              reply_markup=source_choices())
         return
     if len(raw_urls) == 1 and is_spotify_track_url(raw_urls[0]):
-        search_queries[message.from_user.id] = raw_urls[0]
+        url = raw_urls[0]
         try:
-            results = await asyncio.to_thread(search_music, raw_urls[0], "spotify")
-        except MediaDownloadError as exc:
-            await message.answer(f"⚠️ {escape(str(exc))}")
-            return
-        search_sources[message.from_user.id] = "spotify"
-        search_results[message.from_user.id] = results
-        text, markup = result_page(message.from_user.id, 0)
-        await message.answer(text, reply_markup=markup)
+            info = await asyncio.to_thread(get_spotify_track_info, url)
+        except Exception:
+            info = {"title": "Трек Spotify", "artist": "", "url": url}
+        title = info.get("title") or "Трек Spotify"
+        artist = info.get("artist") or ""
+        pending[message.from_user.id] = [url]
+        buttons = [
+            [InlineKeyboardButton(text="⬇️ Скачать MP3", callback_data="dl:audio")],
+            [InlineKeyboardButton(text="🟢 Открыть в Spotify", url=url)],
+        ]
+        caption = f"🎵 <b>{escape(title)}</b>"
+        if artist:
+            caption += f"\nИсполнитель: <b>{escape(artist)}</b>"
+        caption += "\n\n🟢 Трек найден! Нажмите кнопку ниже, чтобы скачать аудио:"
+        await message.answer(caption, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
         return
     try:
         urls = [extract_supported_url(raw) for raw in raw_urls]
@@ -489,16 +496,24 @@ async def choose_track(callback: CallbackQuery) -> None:
         await callback.message.answer("Поиск устарел. Повторите /music.")
         return
     item = results[index]
-    if not item.get("downloadable", True):
+    if not item.get("downloadable", True) or is_spotify_track_url(item.get("url", "")):
+        title = item.get("title", "")
+        artist = item.get("artist", "")
+        spotify_url = item.get("url", "")
+        pending[callback.from_user.id] = [spotify_url]
+        buttons = [[InlineKeyboardButton(text="⬇️ Скачать MP3", callback_data="dl:audio")]]
+        if spotify_url and is_spotify_track_url(spotify_url):
+            buttons.append([InlineKeyboardButton(text="🟢 Открыть в Spotify", url=spotify_url)])
+        header = f"🎵 <b>{escape(title)}</b>"
+        if artist:
+            header += f"\nИсполнитель: <b>{escape(artist)}</b>"
         await callback.message.answer(
-            f"🎵 <b>{escape(item['title'])}</b>\nЭто трек Spotify. Его можно открыть в Spotify; "
-            "бот не получает MP3 из Spotify.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🟢 Открыть в Spotify", url=item["url"])]]),
+            f"{header}\n\n🟢 Найдено в Spotify. Нажмите кнопку ниже, чтобы скачать:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
         return
     pending[callback.from_user.id] = [item["url"]]
-    detail = f"Источник: {escape(item['source'])}. Скачаю аудио выбранной записи, если она доступна."
+    detail = f"Источник: {escape(item['source'])}."
     await callback.message.answer(f"🎵 <b>{escape(item['title'])}</b>\n{detail}",
                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                       [InlineKeyboardButton(text="⬇️ Скачать MP3", callback_data="dl:audio")]]))
@@ -565,8 +580,16 @@ async def download_choice(callback: CallbackQuery) -> None:
                             media = await asyncio.to_thread(download_media, url, Path(tmp), max_bytes, quality)
                             caption = f"<b>{escape(media.title[:180])}</b>\nИсточник: {escape(media.source_url[:700])}"
                             upload = FSInputFile(media.path)
-                            if quality == "audio":
-                                await callback.message.answer_audio(upload, caption=caption, request_timeout=300)
+                            if quality == "audio" or media.path.suffix.lower() in (".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"):
+                                thumb = FSInputFile(media.thumbnail_path) if media.thumbnail_path and media.thumbnail_path.exists() else None
+                                await callback.message.answer_audio(
+                                    upload,
+                                    caption=caption,
+                                    title=media.title,
+                                    performer=media.artist or None,
+                                    thumbnail=thumb,
+                                    request_timeout=300,
+                                )
                             elif media.path.suffix.lower() == ".mp4":
                                 try:
                                     await callback.message.answer_video(upload, caption=caption, supports_streaming=True, request_timeout=300)

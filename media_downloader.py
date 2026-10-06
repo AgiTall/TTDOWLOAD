@@ -6,6 +6,7 @@ import re
 import json
 import os
 import time
+import shutil
 import base64
 import logging
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ SUPPORTED_DOMAINS = (
     "x.com",
     "vimeo.com",
     "soundcloud.com",
+    "spotify.com",
+    "spotify.link",
 )
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
@@ -56,9 +59,57 @@ def is_spotify_track_url(url: str) -> bool:
         port = parsed.port
     except ValueError:
         return False
-    return (parsed.scheme == "https" and (parsed.hostname or "").lower() == "open.spotify.com"
-            and parsed.path.startswith("/track/") and not parsed.username
-            and not parsed.password and not port)
+    host = (parsed.hostname or "").lower()
+    if host not in ("open.spotify.com", "spotify.link", "spotify.com") and not host.endswith(".spotify.com"):
+        return False
+    if parsed.username or parsed.password or port:
+        return False
+    return bool(re.search(r"/(?:intl-[a-zA-Z-]+/)?track/[a-zA-Z0-9]+", parsed.path))
+
+
+def get_spotify_track_info(url: str) -> dict:
+    """Extract track title, artist, and album art from Spotify track URL."""
+    # 1. Try Spotify OpenGraph metadata
+    try:
+        req = Request(
+            url,
+            headers={
+                "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        with urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", "ignore")
+        title_m = re.search(r'<meta property="og:title" content="([^"]+)"', html)
+        desc_m = re.search(r'<meta property="og:description" content="([^"]+)"', html)
+        artist_m = re.search(r'<meta name="music:musician_description" content="([^"]+)"', html)
+        img_m = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+
+        title = title_m.group(1).strip() if title_m else ""
+        artist = artist_m.group(1).strip() if artist_m else ""
+        if not artist and desc_m:
+            desc = desc_m.group(1)
+            artist = desc.split("·")[0].strip() if "·" in desc else desc.split(" - ")[0].strip()
+        img = img_m.group(1).strip() if img_m else ""
+        if title:
+            return {"title": title, "artist": artist, "image": img, "url": url}
+    except Exception as exc:
+        logger.debug("Spotify OpenGraph fetch failed for %s: %s", url, exc)
+
+    # 2. Fallback to Spotify oEmbed
+    try:
+        oembed_url = "https://open.spotify.com/oembed?url=" + quote(url, safe="")
+        req = Request(oembed_url, headers={"User-Agent": _next_ua()})
+        with urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+            title = data.get("title", "").strip()
+            img = data.get("thumbnail_url", "").strip()
+            if title:
+                return {"title": title, "artist": "", "image": img, "url": url}
+    except Exception as exc:
+        logger.debug("Spotify oEmbed fetch failed for %s: %s", url, exc)
+
+    return {"title": "Трек Spotify", "artist": "", "image": "", "url": url}
 
 
 class MediaDownloadError(RuntimeError):
@@ -273,6 +324,8 @@ class DownloadedMedia:
     path: Path
     title: str
     source_url: str
+    artist: str = ""
+    thumbnail_path: Path | None = None
 
 
 def extract_supported_url(text: str) -> str:
@@ -343,22 +396,21 @@ def get_media_info(url: str) -> dict:
 def search_music(query: str, source: str = "all") -> list[dict]:
     results = []
     original_query = query
-    spotify_link_title = None
+    spotify_info = None
     if is_spotify_track_url(query):
-        try:
-            request = Request("https://open.spotify.com/oembed?url=" + quote(query, safe=""),
-                              headers={"User-Agent": _next_ua()})
-            with urlopen(request, timeout=10) as response:
-                spotify_link_title = json.load(response).get("title")
-                query = spotify_link_title or query
-        except (OSError, ValueError):
-            pass
+        spotify_info = get_spotify_track_info(query)
+        artist = spotify_info.get("artist") or ""
+        title = spotify_info.get("title") or ""
+        query = f"{artist} - {title}".strip(" -") or query
     if source == "spotify":
         if os.getenv("SPOTIFY_EXTENDED_ACCESS") != "1":
             if is_spotify_track_url(original_query):
-                return [{"title": spotify_link_title or "Трек Spotify", "artist": "",
+                title = (spotify_info and spotify_info.get("title")) or "Трек Spotify"
+                artist = (spotify_info and spotify_info.get("artist")) or ""
+                return [{"title": title, "artist": artist,
                          "url": original_query, "source": "Spotify-ссылка",
-                         "downloadable": False}]
+                         "downloadable": False,
+                         "image": (spotify_info and spotify_info.get("image")) or ""}]
             raise MediaDownloadError(
                 "Поиск по каталогу Spotify недоступен для публичного бота без одобренного "
                 "Extended Quota Mode. Ссылку Spotify можно прислать напрямую."
@@ -489,9 +541,20 @@ def _ytdlp_download(url: str, directory: Path, max_bytes: int, quality: str) -> 
         options["cookiefile"] = cookies_path
 
     if quality == "audio":
-        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}]
+        if shutil.which("ffmpeg"):
+            options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}]
+        else:
+            options["format"] = "bestaudio/best"
     else:
-        options["merge_output_format"] = "mp4"
+        if shutil.which("ffmpeg"):
+            options["merge_output_format"] = "mp4"
+
+    # Android/iOS client bypass for YouTube on cloud IPs
+    options["extractor_args"] = {
+        "youtube": {
+            "player_client": ["android", "ios", "web_creator", "mweb"]
+        }
+    }
 
     try:
         with YoutubeDL(options) as ydl:
@@ -527,6 +590,90 @@ def _ytdlp_download(url: str, directory: Path, max_bytes: int, quality: str) -> 
     )
 
 
+def _download_spotify_audio(url: str, directory: Path, max_bytes: int) -> DownloadedMedia:
+    """Download audio for a Spotify track by resolving it via SoundCloud or YouTube."""
+    info = get_spotify_track_info(url)
+    title = info.get("title") or "Трек Spotify"
+    artist = info.get("artist") or ""
+    query = f"{artist} - {title}".strip(" -") or title
+
+    thumbnail_path = None
+    if info.get("image"):
+        try:
+            thumb_file = directory / "cover.jpg"
+            _download_url_to_file(info["image"], thumb_file, 5 * 1024 * 1024, timeout=15)
+            if thumb_file.exists() and thumb_file.stat().st_size > 0:
+                thumbnail_path = thumb_file
+        except Exception as exc:
+            logger.debug("Failed to download Spotify cover thumbnail: %s", exc)
+
+    # 1. Search SoundCloud first (fastest, unblocked on cloud hosting)
+    try:
+        sc_tracks = search_music(query, "sc")
+        if sc_tracks and sc_tracks[0].get("url"):
+            try:
+                media = _ytdlp_download(sc_tracks[0]["url"], directory, max_bytes, "audio")
+                return DownloadedMedia(
+                    path=media.path,
+                    title=f"{artist} - {title}".strip(" -") if artist else title,
+                    source_url=url,
+                    artist=artist,
+                    thumbnail_path=thumbnail_path,
+                )
+            except Exception as exc:
+                logger.warning("SoundCloud audio download failed for %s: %s", query, exc)
+    except Exception as exc:
+        logger.warning("SoundCloud search failed for %s: %s", query, exc)
+
+    # 2. Search YouTube
+    try:
+        yt_tracks = search_music(query, "yt")
+        if yt_tracks and yt_tracks[0].get("url"):
+            yt_url = yt_tracks[0]["url"]
+            cobalt_disabled = os.getenv("COBALT_DISABLED", "").lower() in ("1", "true", "yes")
+            if not cobalt_disabled:
+                try:
+                    media = _cobalt_download(yt_url, directory, max_bytes, "audio")
+                    return DownloadedMedia(
+                        path=media.path,
+                        title=f"{artist} - {title}".strip(" -") if artist else title,
+                        source_url=url,
+                        artist=artist,
+                        thumbnail_path=thumbnail_path,
+                    )
+                except Exception as exc:
+                    logger.debug("Cobalt download failed for %s: %s", yt_url, exc)
+            try:
+                media = _ytdlp_download(yt_url, directory, max_bytes, "audio")
+                return DownloadedMedia(
+                    path=media.path,
+                    title=f"{artist} - {title}".strip(" -") if artist else title,
+                    source_url=url,
+                    artist=artist,
+                    thumbnail_path=thumbnail_path,
+                )
+            except Exception as exc:
+                logger.warning("YouTube audio download failed for %s: %s", query, exc)
+    except Exception as exc:
+        logger.warning("YouTube search failed for %s: %s", query, exc)
+
+    # 3. Direct yt-dlp search query fallback
+    for search_prefix in (f"scsearch1:{query}", f"ytsearch1:{query}"):
+        try:
+            media = _ytdlp_download(search_prefix, directory, max_bytes, "audio")
+            return DownloadedMedia(
+                path=media.path,
+                title=f"{artist} - {title}".strip(" -") if artist else title,
+                source_url=url,
+                artist=artist,
+                thumbnail_path=thumbnail_path,
+            )
+        except Exception:
+            continue
+
+    raise MediaDownloadError(f"Не удалось найти и скачать аудио для трека «{title}».")
+
+
 def _determine_host(url: str) -> str:
     """Extract the base domain from a URL."""
     host = (urlsplit(url).hostname or "").lower().rstrip(".")
@@ -537,12 +684,17 @@ def download_media(url: str, directory: Path, max_bytes: int, quality: str = "72
     """Скачивает один файл; функцию следует запускать через asyncio.to_thread.
     
     Strategy:
+    0. Spotify → resolve via SoundCloud/YouTube and download as audio
     1. TikTok → TikWM API (no watermark), fallback to yt-dlp
     2. YouTube → Try cobalt.tools first (works from cloud IPs), fallback to yt-dlp
     3. Instagram/Twitter/X → Try cobalt.tools first, fallback to yt-dlp
     4. Everything else → yt-dlp with retries
     """
     directory.mkdir(parents=True, exist_ok=True)
+
+    # --- Spotify: resolve track via SoundCloud/YouTube and download audio ---
+    if is_spotify_track_url(url):
+        return _download_spotify_audio(url, directory, max_bytes)
 
     if quality not in {"1080", "720", "360", "audio"}:
         raise MediaDownloadError("Неизвестный формат файла.")
@@ -593,3 +745,4 @@ def download_media(url: str, directory: Path, max_bytes: int, quality: str = "72
     raise last_error or MediaDownloadError(
         "Не удалось скачать файл. Попробуйте другую ссылку или повторите позже."
     )
+

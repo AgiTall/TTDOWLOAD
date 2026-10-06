@@ -22,3 +22,11 @@ services:
         value: "49"
       - key: MAX_CONCURRENT_DOWNLOADS
         value: "2"
+      - key: COBALT_API_URL
+        value: "https://api.cobalt.tools"
+      - key: COBALT_API_KEY
+        sync: false
+      - key: COBALT_DISABLED
+        value: "0"
+      - key: YT_COOKIES_FILE
+        sync: false

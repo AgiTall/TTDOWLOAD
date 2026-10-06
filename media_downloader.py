@@ -1,19 +1,23 @@
-"""Безопасная загрузка одного медиафайла через yt-dlp."""
+"""Безопасная загрузка одного медиафайла через yt-dlp + fallback API."""
 
 from __future__ import annotations
 
 import re
 import json
 import os
+import time
 import base64
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlencode, quote, urljoin
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
+from urllib.error import HTTPError, URLError
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
 
+logger = logging.getLogger(__name__)
 
 SUPPORTED_DOMAINS = (
     "tiktok.com",
@@ -29,6 +33,21 @@ SUPPORTED_DOMAINS = (
 )
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+
+# User-Agent strings for rotation
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+]
+_ua_index = 0
+
+
+def _next_ua() -> str:
+    global _ua_index
+    ua = _USER_AGENTS[_ua_index % len(_USER_AGENTS)]
+    _ua_index += 1
+    return ua
 
 
 def is_spotify_track_url(url: str) -> bool:
@@ -55,7 +74,8 @@ class FileTooLargeError(MediaDownloadError):
 
 
 TIKWM_MEDIA_DOMAINS = ("tikwm.com", "tiktokcdn.com", "tiktokcdn-us.com",
-                       "tiktokcdn-eu.com", "byteoversea.com", "ibytedtos.com")
+                       "tiktokcdn-eu.com", "byteoversea.com", "ibytedtos.com",
+                       "muscdn.com", "musemuse.cn", "bytedance.com")
 
 
 def _allowed_tikwm_media(url: str) -> bool:
@@ -77,24 +97,65 @@ class _SafeTikwmRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _download_url_to_file(url: str, path: Path, max_bytes: int, *,
+                          headers: dict | None = None,
+                          timeout: int = 60) -> None:
+    """Download a URL to a local file with size checking."""
+    hdr = {"User-Agent": _next_ua()}
+    if headers:
+        hdr.update(headers)
+    request = Request(url, headers=hdr)
+    with urlopen(request, timeout=timeout) as response:
+        with path.open("wb") as output:
+            total = 0
+            while chunk := response.read(256 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise FileTooLargeError(
+                        "Файл превышает допустимый размер для Telegram."
+                    )
+                output.write(chunk)
+
+
+def _is_valid_mp4(path: Path) -> bool:
+    """Check if a file starts with a valid MP4 ftyp header."""
+    try:
+        with path.open("rb") as f:
+            header = f.read(12)
+        return len(header) >= 8 and header[4:8] == b"ftyp"
+    except OSError:
+        return False
+
+
 def _tikwm_video(url: str, directory: Path, max_bytes: int, quality: str) -> DownloadedMedia:
     """Get TikWM's clean HD/SD MP4. Never fall back to a watermarked link."""
     form = urlencode({"url": url, "hd": "1"}).encode()
     request = Request("https://www.tikwm.com/api/", data=form,
                       headers={"Content-Type": "application/x-www-form-urlencoded",
-                               "User-Agent": "Mozilla/5.0"})
-    try:
-        with urlopen(request, timeout=15) as response:
-            payload = json.load(response)
-    except (OSError, ValueError) as exc:
-        raise MediaDownloadError("Не удалось получить видео TikTok без водяного знака. Попробуйте позже.") from exc
-    data = payload.get("data") if isinstance(payload, dict) and payload.get("code") == 0 else None
-    if not isinstance(data, dict):
-        raise MediaDownloadError("Видео TikTok недоступно через сервис без водяного знака.")
+                                "User-Agent": _next_ua()})
+    
+    # Retry TikWM API up to 3 times
+    data = None
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=20) as response:
+                payload = json.load(response)
+            if isinstance(payload, dict) and payload.get("code") == 0 and isinstance(payload.get("data"), dict):
+                data = payload["data"]
+                break
+        except (OSError, ValueError) as exc:
+            logger.warning("TikWM attempt %d failed: %s", attempt + 1, exc)
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    
+    if not data:
+        raise MediaDownloadError("Не удалось получить видео TikTok без водяного знака. Попробуйте позже.")
+    
     if quality == "1080":
         candidates = [data.get("hdplay"), data.get("play")]
     else:
         candidates = [data.get("play"), data.get("hdplay")]
+    
     opener = build_opener(_SafeTikwmRedirect())
     too_large = False
     for raw_link in candidates:
@@ -106,7 +167,7 @@ def _tikwm_video(url: str, directory: Path, max_bytes: int, quality: str) -> Dow
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(data.get("id") or "video"))[:32] or "video"
         path = directory / f"tiktok-{safe_id}.mp4"
         try:
-            with opener.open(Request(media_url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30) as response:
+            with opener.open(Request(media_url, headers={"User-Agent": _next_ua()}), timeout=45) as response:
                 if not _allowed_tikwm_media(response.url):
                     continue
                 with path.open("wb") as output:
@@ -116,9 +177,7 @@ def _tikwm_video(url: str, directory: Path, max_bytes: int, quality: str) -> Dow
                         if total > max_bytes:
                             raise FileTooLargeError("Файл TikTok превышает допустимый размер для Telegram.")
                         output.write(chunk)
-            with path.open("rb") as downloaded:
-                header = downloaded.read(12)
-            if len(header) >= 8 and header[4:8] == b"ftyp":
+            if _is_valid_mp4(path):
                 return DownloadedMedia(path, str(data.get("title") or "TikTok видео")[:200], url)
         except FileTooLargeError:
             path.unlink(missing_ok=True)
@@ -130,6 +189,83 @@ def _tikwm_video(url: str, directory: Path, max_bytes: int, quality: str) -> Dow
     if too_large:
         raise FileTooLargeError("Даже доступная версия TikTok без водяного знака превышает лимит файла.")
     raise MediaDownloadError("Не удалось скачать версию TikTok без водяного знака. Попробуйте позже.")
+
+
+def _cobalt_download(url: str, directory: Path, max_bytes: int, quality: str) -> DownloadedMedia:
+    """
+    Use cobalt.tools API as a fallback downloader for YouTube, Instagram, Twitter, etc.
+    cobalt.tools is a free open-source service that works from cloud IPs.
+    """
+    cobalt_api = os.getenv("COBALT_API_URL", "https://api.cobalt.tools")
+
+    quality_map = {
+        "1080": "1080",
+        "720": "720",
+        "360": "360",
+        "audio": "128",
+    }
+    
+    body = {
+        "url": url,
+        "videoQuality": quality_map.get(quality, "720"),
+        "filenameStyle": "basic",
+    }
+    
+    if quality == "audio":
+        body["downloadMode"] = "audio"
+        body["audioFormat"] = "mp3"
+    else:
+        body["downloadMode"] = "auto"
+    
+    request_data = json.dumps(body).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": _next_ua(),
+    }
+    
+    cobalt_key = os.getenv("COBALT_API_KEY", "")
+    if cobalt_key:
+        headers["Authorization"] = f"Api-Key {cobalt_key}"
+    
+    req = Request(cobalt_api + "/", data=request_data, headers=headers, method="POST")
+    
+    try:
+        with urlopen(req, timeout=30) as response:
+            result = json.load(response)
+    except (OSError, ValueError) as exc:
+        raise MediaDownloadError(f"Cobalt API недоступен: {exc}") from exc
+    
+    status = result.get("status")
+    if status == "error":
+        error_code = result.get("error", {}).get("code", "unknown")
+        raise MediaDownloadError(f"Cobalt не смог обработать ссылку (код: {error_code}).")
+    
+    download_url = result.get("url")
+    if not download_url:
+        # Cobalt may return a 'tunnel' or 'redirect' status
+        if status == "tunnel":
+            download_url = result.get("url")
+        elif status == "redirect":
+            download_url = result.get("url")
+        if not download_url:
+            raise MediaDownloadError("Cobalt API не вернул ссылку на скачивание.")
+    
+    ext = "mp3" if quality == "audio" else "mp4"
+    filename = f"cobalt_media.{ext}"
+    path = directory / filename
+    
+    _download_url_to_file(download_url, path, max_bytes, timeout=120)
+    
+    if not path.exists() or path.stat().st_size == 0:
+        path.unlink(missing_ok=True)
+        raise MediaDownloadError("Cobalt: скачанный файл пуст.")
+    
+    title = result.get("filename", "Видео")
+    # Clean up title
+    title = re.sub(r"\.[^.]+$", "", title)[:200] or "Видео"
+    
+    return DownloadedMedia(path=path, title=title, source_url=url)
 
 
 @dataclass(frozen=True)
@@ -168,7 +304,7 @@ def extract_supported_url(text: str) -> str:
 
 
 def _find_downloaded_file(directory: Path) -> Path:
-    ignored_suffixes = {".part", ".ytdl", ".temp"}
+    ignored_suffixes = {".part", ".ytdl", ".temp", ".json", ".txt"}
     files = [
         path
         for path in directory.iterdir()
@@ -180,9 +316,22 @@ def _find_downloaded_file(directory: Path) -> Path:
 
 
 def get_media_info(url: str) -> dict:
+    opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "socket_timeout": 20,
+        "no_warnings": True,
+        "geo_bypass": True,
+        "extractor_retries": 3,
+    }
+    # Add cookies if available
+    cookies_path = os.getenv("YT_COOKIES_FILE", "")
+    if cookies_path and os.path.isfile(cookies_path):
+        opts["cookiefile"] = cookies_path
+    
     try:
-        with YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True,
-                        "socket_timeout": 20}) as ydl:
+        with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise MediaDownloadError("Не удалось получить сведения о файле.")
@@ -198,7 +347,7 @@ def search_music(query: str, source: str = "all") -> list[dict]:
     if is_spotify_track_url(query):
         try:
             request = Request("https://open.spotify.com/oembed?url=" + quote(query, safe=""),
-                              headers={"User-Agent": "Mozilla/5.0"})
+                              headers={"User-Agent": _next_ua()})
             with urlopen(request, timeout=10) as response:
                 spotify_link_title = json.load(response).get("title")
                 query = spotify_link_title or query
@@ -250,8 +399,15 @@ def search_music(query: str, source: str = "all") -> list[dict]:
         if item not in {"yt", "sc"}:
             continue
         try:
-            with YoutubeDL({"quiet": True, "extract_flat": True, "noplaylist": True,
-                            "socket_timeout": 15}) as ydl:
+            opts = {
+                "quiet": True,
+                "extract_flat": True,
+                "noplaylist": True,
+                "socket_timeout": 15,
+                "no_warnings": True,
+                "geo_bypass": True,
+            }
+            with YoutubeDL(opts) as ydl:
                 search_query = query
                 if item == "yt":
                     search_query += " песня музыка" if re.search(r"[а-яё]", query, re.I) else " song music"
@@ -296,56 +452,63 @@ def rank_music_results(query: str, results: list[dict]) -> list[dict]:
     return [item for _, _, item in ranked]
 
 
-def download_media(url: str, directory: Path, max_bytes: int, quality: str = "720") -> DownloadedMedia:
-    """Скачивает один файл; функцию следует запускать через asyncio.to_thread."""
-    directory.mkdir(parents=True, exist_ok=True)
+def _ytdlp_download(url: str, directory: Path, max_bytes: int, quality: str) -> DownloadedMedia:
+    """Download via yt-dlp with robust options for cloud hosting."""
     max_megabytes = max(1, max_bytes // (1024 * 1024))
-
-    if quality not in {"1080", "720", "360", "audio"}:
-        raise MediaDownloadError("Неизвестный формат файла.")
-    host = (urlsplit(url).hostname or "").lower().rstrip(".")
-    if quality != "audio" and (host == "tiktok.com" or host.endswith(".tiktok.com")):
-        return _tikwm_video(url, directory, max_bytes, quality)
     height = {"1080": 1080, "720": 720, "360": 480}.get(quality)
+
     options = {
         "format": "bestaudio/best" if quality == "audio" else
-                  f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
+                  f"bestvideo[height<={height}][filesize<{max_bytes}]+bestaudio/best[height<={height}][filesize<{max_bytes}]/best[height<={height}]/best",
         "outtmpl": str(directory / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "max_filesize": max_bytes,
-        "socket_timeout": 20,
-        "retries": 2,
-        "fragment_retries": 2,
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        "file_access_retries": 3,
+        "extractor_retries": 3,
+        "retry_sleep_functions": {"extractor": lambda n: 2 ** n},
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
         "windowsfilenames": True,
+        "geo_bypass": True,
+        "nocheckcertificate": False,
+        # Important for cloud hosting: these headers help avoid blocks
+        "http_headers": {
+            "User-Agent": _next_ua(),
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
     }
+
+    # Add cookies if available (crucial for YouTube on cloud IPs)
+    cookies_path = os.getenv("YT_COOKIES_FILE", "")
+    if cookies_path and os.path.isfile(cookies_path):
+        options["cookiefile"] = cookies_path
+
     if quality == "audio":
         options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}]
     else:
         options["merge_output_format"] = "mp4"
 
-    candidates = [url]
-    if quality == "audio" and url.startswith("scsearch1:"):
-        candidates.append("ytsearch1:" + url.removeprefix("scsearch1:"))
-    info = None
-    for candidate in candidates:
-        try:
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(candidate, download=True)
-            if info:
-                break
-        except YtDlpDownloadError as exc:
-            message = str(exc)
-            if "larger than max-filesize" in message.lower() or "max-filesize" in message.lower():
-                raise FileTooLargeError(
-                    f"Файл больше {max_megabytes} МБ — Telegram не сможет принять его от бота."
-                ) from exc
-            if candidate == candidates[-1]:
-                raise MediaDownloadError(
-                    "Не удалось скачать файл. Проверьте, что он доступен без входа в аккаунт."
-                ) from exc
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except YtDlpDownloadError as exc:
+        message = str(exc).lower()
+        if "larger than max-filesize" in message or "max-filesize" in message:
+            raise FileTooLargeError(
+                f"Файл больше {max_megabytes} МБ — Telegram не сможет принять его от бота."
+            ) from exc
+        if "sign in" in message or "bot" in message or "captcha" in message:
+            raise MediaDownloadError(
+                "Источник требует подтверждение — попробуйте другое видео или подождите."
+            ) from exc
+        raise MediaDownloadError(
+            "Не удалось скачать файл. Проверьте, что он доступен без входа в аккаунт."
+        ) from exc
 
     if not info:
         raise MediaDownloadError("Не удалось получить сведения о видео.")
@@ -361,4 +524,72 @@ def download_media(url: str, directory: Path, max_bytes: int, quality: str = "72
         path=path,
         title=str(info.get("title") or "Видео")[:200],
         source_url=str(info.get("webpage_url") or url),
+    )
+
+
+def _determine_host(url: str) -> str:
+    """Extract the base domain from a URL."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    return host
+
+
+def download_media(url: str, directory: Path, max_bytes: int, quality: str = "720") -> DownloadedMedia:
+    """Скачивает один файл; функцию следует запускать через asyncio.to_thread.
+    
+    Strategy:
+    1. TikTok → TikWM API (no watermark), fallback to yt-dlp
+    2. YouTube → Try cobalt.tools first (works from cloud IPs), fallback to yt-dlp
+    3. Instagram/Twitter/X → Try cobalt.tools first, fallback to yt-dlp
+    4. Everything else → yt-dlp with retries
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+
+    if quality not in {"1080", "720", "360", "audio"}:
+        raise MediaDownloadError("Неизвестный формат файла.")
+
+    host = _determine_host(url)
+    
+    # --- TikTok: use TikWM API for video (no watermark) ---
+    if quality != "audio" and (host == "tiktok.com" or host.endswith(".tiktok.com")):
+        try:
+            return _tikwm_video(url, directory, max_bytes, quality)
+        except FileTooLargeError:
+            raise
+        except MediaDownloadError:
+            logger.warning("TikWM failed for %s, trying yt-dlp", url)
+            # Fall through to yt-dlp
+
+    # --- YouTube, Instagram, Twitter/X: try cobalt.tools first ---
+    cobalt_domains = ("youtube.com", "youtu.be", "instagram.com", 
+                      "twitter.com", "x.com", "facebook.com", "fb.watch",
+                      "tiktok.com")
+    use_cobalt = any(host == d or host.endswith("." + d) for d in cobalt_domains)
+    
+    if use_cobalt:
+        cobalt_disabled = os.getenv("COBALT_DISABLED", "").lower() in ("1", "true", "yes")
+        if not cobalt_disabled:
+            try:
+                return _cobalt_download(url, directory, max_bytes, quality)
+            except FileTooLargeError:
+                raise
+            except (MediaDownloadError, Exception) as exc:
+                logger.warning("Cobalt failed for %s: %s, trying yt-dlp", url, exc)
+
+    # --- Fallback: yt-dlp ---
+    candidates = [url]
+    if quality == "audio" and url.startswith("scsearch1:"):
+        candidates.append("ytsearch1:" + url.removeprefix("scsearch1:"))
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            return _ytdlp_download(candidate, directory, max_bytes, quality)
+        except FileTooLargeError:
+            raise
+        except MediaDownloadError as exc:
+            last_error = exc
+            logger.warning("yt-dlp failed for %s: %s", candidate, exc)
+    
+    raise last_error or MediaDownloadError(
+        "Не удалось скачать файл. Попробуйте другую ссылку или повторите позже."
     )

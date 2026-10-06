@@ -1,4 +1,4 @@
-"""Telegram Media Downloader: long polling + безопасная загрузка через yt-dlp."""
+"""Telegram Media Downloader: long polling + безопасная загрузка через yt-dlp + fallback APIs."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import re
+import traceback
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 from contextlib import suppress
@@ -539,6 +540,7 @@ async def download_choice(callback: CallbackQuery) -> None:
             return
     active_users.add(user_id)
     status = await callback.message.answer(f"⏳ Обрабатываю {len(targets)} файл(ов)…")
+    bot = callback.message.bot
     try:
         async with download_slots:
             for index, url in enumerate(targets, 1):
@@ -551,28 +553,45 @@ async def download_choice(callback: CallbackQuery) -> None:
                     max_mb = min(env_int("MAX_UPLOAD_MB", 49, 1, 49),
                                  account.max_mb if account else 49)
                     max_bytes = max_mb * 1024 * 1024
-                    with tempfile.TemporaryDirectory(prefix="telegram-media-") as tmp:
-                        media = await asyncio.to_thread(download_media, url, Path(tmp), max_bytes, quality)
-                        caption = f"<b>{escape(media.title[:180])}</b>\nИсточник: {escape(media.source_url[:700])}"
-                        upload = FSInputFile(media.path)
-                        if quality == "audio":
-                            await callback.message.answer_audio(upload, caption=caption, request_timeout=180)
-                        elif media.path.suffix.lower() == ".mp4":
-                            try:
-                                await callback.message.answer_video(upload, caption=caption, supports_streaming=True, request_timeout=180)
-                            except TelegramBadRequest:
-                                await callback.message.answer_document(FSInputFile(media.path), caption=caption, request_timeout=180)
-                        else:
-                            await callback.message.answer_document(upload, caption=caption, request_timeout=180)
+
+                    # Send typing/upload action so user sees progress
+                    action = ChatAction.UPLOAD_VOICE if quality == "audio" else ChatAction.UPLOAD_VIDEO
+                    typing_task = asyncio.create_task(
+                        _keep_action(bot, callback.message.chat.id, action)
+                    )
+
+                    try:
+                        with tempfile.TemporaryDirectory(prefix="telegram-media-") as tmp:
+                            media = await asyncio.to_thread(download_media, url, Path(tmp), max_bytes, quality)
+                            caption = f"<b>{escape(media.title[:180])}</b>\nИсточник: {escape(media.source_url[:700])}"
+                            upload = FSInputFile(media.path)
+                            if quality == "audio":
+                                await callback.message.answer_audio(upload, caption=caption, request_timeout=300)
+                            elif media.path.suffix.lower() == ".mp4":
+                                try:
+                                    await callback.message.answer_video(upload, caption=caption, supports_streaming=True, request_timeout=300)
+                                except TelegramBadRequest:
+                                    await callback.message.answer_document(FSInputFile(media.path), caption=caption, request_timeout=300)
+                            else:
+                                await callback.message.answer_document(upload, caption=caption, request_timeout=300)
+                    finally:
+                        typing_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await typing_task
+
                     if url not in history[user_id]:
                         history[user_id].appendleft(url)
                     if quota.configured():
                         account = await asyncio.to_thread(quota.record_success, user_id)
                 except (FileTooLargeError, MediaDownloadError) as exc:
+                    logging.warning("Download error for %s: %s", url, exc)
                     await callback.message.answer(f"❌ {index}/{len(targets)}: {escape(str(exc))}")
                 except Exception:
                     logging.exception("Ошибка загрузки %s", url)
-                    await callback.message.answer(f"❌ {index}/{len(targets)}: внутренняя ошибка.")
+                    await callback.message.answer(
+                        f"❌ {index}/{len(targets)}: внутренняя ошибка. "
+                        "Попробуйте ещё раз или отправьте другую ссылку."
+                    )
         with suppress(TelegramBadRequest):
             await status.delete()
         if account and quota.configured():
@@ -580,6 +599,16 @@ async def download_choice(callback: CallbackQuery) -> None:
                 f"✅ Осталось загрузок: <b>{account.remaining}</b>. Обновление {reset_text(account)}.")
     finally:
         active_users.discard(user_id)
+
+
+async def _keep_action(bot: Bot, chat_id: int, action: ChatAction) -> None:
+    """Keep sending chat action every 4 seconds until cancelled."""
+    while True:
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=action)
+        except Exception:
+            pass
+        await asyncio.sleep(4)
 
 
 @router.message()
